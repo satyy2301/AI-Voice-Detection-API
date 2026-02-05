@@ -12,7 +12,7 @@ Main entry point. Run with:
 
 from fastapi import FastAPI, Header, HTTPException, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 
 from preprocessing import preprocess_audio
 from ensemble_inference import ensure_model_loaded, predict, SUPPORTED_LANGUAGES
@@ -22,9 +22,11 @@ from security import validate_api_key
 # Define request/response schemas
 class DetectRequest(BaseModel):
     """Request schema for /detect endpoint."""
+    model_config = ConfigDict(populate_by_name=True)
+
     language: str
-    audio_format: str
-    audio_base64: str
+    audio_format: str = Field(alias="audioFormat")
+    audio_base64: str = Field(alias="audioBase64")
 
 
 class DetectResponse(BaseModel):
