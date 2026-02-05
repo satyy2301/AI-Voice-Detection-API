@@ -3,6 +3,7 @@ Optimized inference module for AI vs Human voice classification.
 
 Features:
 - Wav2Vec2-only (meets constraints)
+- Low-memory loading
 - INT8 quantization (smaller + faster)
 - Multilingual support via XLSR-53
 """
@@ -26,13 +27,13 @@ MODEL_CANDIDATES = [
     "facebook/wav2vec2-base-960h"   # Fallback option
 ]
 
-# Global model (loaded once at startup)
+# Global model (loaded on demand)
 wav2vec_model: Optional[Wav2Vec2ForCTC] = None
 wav2vec_feature_extractor: Optional[Wav2Vec2FeatureExtractor] = None
 quantized: bool = False
 
 
-def load_model(use_quantization: bool = True):
+def load_model(use_quantization: bool = True, low_cpu_mem_usage: bool = True):
     """
     Load Wav2Vec2 model (multilingual, quantized).
 
@@ -49,15 +50,21 @@ def load_model(use_quantization: bool = True):
     for model_name in MODEL_CANDIDATES:
         try:
             wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
-            wav2vec_model = Wav2Vec2ForCTC.from_pretrained(model_name)
+            try:
+                wav2vec_model = Wav2Vec2ForCTC.from_pretrained(
+                    model_name,
+                    low_cpu_mem_usage=low_cpu_mem_usage
+                )
+            except TypeError:
+                wav2vec_model = Wav2Vec2ForCTC.from_pretrained(model_name)
             wav2vec_model.eval()
 
             if use_quantization:
                 print("⚡ Applying INT8 dynamic quantization...")
-                # Aggressive quantization: quantize all Linear layers
+                # Quantize Linear layers for size reduction without accuracy risk
                 wav2vec_model = torch.quantization.quantize_dynamic(
                     wav2vec_model,
-                    {torch.nn.Linear, torch.nn.LSTM, torch.nn.GRU},
+                    {torch.nn.Linear},
                     dtype=torch.qint8
                 )
                 quantized = True
@@ -87,6 +94,12 @@ def load_model(use_quantization: bool = True):
     print(f"   Languages supported: {', '.join(SUPPORTED_LANGUAGES)}")
     print(f"   Quantized: {quantized}")
     print()
+
+
+def ensure_model_loaded(use_quantization: bool = True, low_cpu_mem_usage: bool = True):
+    """Lazy-load model on first request to reduce startup memory spikes."""
+    if wav2vec_model is None or wav2vec_feature_extractor is None:
+        load_model(use_quantization=use_quantization, low_cpu_mem_usage=low_cpu_mem_usage)
 
 
 def validate_language(language: str) -> str:
@@ -132,7 +145,7 @@ def predict(audio_waveform: np.ndarray, language: str = "english") -> Dict[str, 
             padding=True
         )
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = wav2vec_model(**inputs, output_hidden_states=True)
             logits = outputs.logits
             hidden_states = outputs.hidden_states

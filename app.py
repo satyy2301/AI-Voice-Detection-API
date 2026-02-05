@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from preprocessing import preprocess_audio
-from ensemble_inference import load_model, predict, SUPPORTED_LANGUAGES
+from ensemble_inference import ensure_model_loaded, predict, SUPPORTED_LANGUAGES
 from security import validate_api_key
 
 
@@ -42,15 +42,14 @@ app = FastAPI(
 )
 
 
-# Load model at startup
+# Startup log (model loads lazily on first request)
 @app.on_event("startup")
 async def startup_event():
-    """Load optimized ensemble models when application starts."""
+    """Log startup; model loads lazily on first request to reduce memory spikes."""
     print("\n" + "="*60)
     print("🚀 AI VOICE DETECTION API - STARTUP")
     print("="*60)
-    print("Loading optimized models with INT8 quantization...")
-    load_model(use_quantization=True)
+    print("Model will load on first request (lazy load).")
     print("="*60 + "\n")
 
 
@@ -60,7 +59,7 @@ async def health():
     """Health check endpoint with model info."""
     return {
         "status": "ok",
-        "model": "wav2vec2-small + Ensemble",
+        "model": "wav2vec2-base + Ensemble",
         "quantization": "INT8",
         "languages": SUPPORTED_LANGUAGES
     }
@@ -111,6 +110,15 @@ async def detect(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Language error: {str(e)}"
+        )
+
+    # Lazy-load model to reduce memory spikes on startup
+    try:
+        ensure_model_loaded(use_quantization=True, low_cpu_mem_usage=True)
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Model load failed: {str(e)}"
         )
 
     # Run inference with language support

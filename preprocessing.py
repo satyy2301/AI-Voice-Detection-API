@@ -7,7 +7,8 @@ Handles Base64 decoding, audio loading, and normalization for ML inference.
 import base64
 import io
 import numpy as np
-import librosa
+import soundfile as sf
+import soxr
 
 
 def decode_base64_audio(audio_base64: str) -> bytes:
@@ -35,7 +36,7 @@ def load_and_process_audio(audio_bytes: bytes, target_sr: int = 16000) -> np.nda
     Load audio from bytes and process it.
 
     Handles:
-    - MP3 and WAV formats
+    - WAV/FLAC/OGG formats via soundfile
     - Convert to mono
     - Resample to 16kHz
     - Trim/pad to 10 seconds max
@@ -51,13 +52,21 @@ def load_and_process_audio(audio_bytes: bytes, target_sr: int = 16000) -> np.nda
         ValueError: If audio loading or processing fails
     """
     try:
-        # Load audio from bytes using librosa
-        # librosa.load handles MP3, WAV, and other formats
-        audio, sr = librosa.load(
-            io.BytesIO(audio_bytes),
-            sr=target_sr,
-            mono=True
-        )
+        # Load audio from bytes using soundfile (lower memory footprint)
+        audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+
+        if audio.size == 0:
+            raise ValueError("Empty audio")
+
+        # Convert to mono
+        if audio.shape[1] > 1:
+            audio = np.mean(audio, axis=1)
+        else:
+            audio = audio[:, 0]
+
+        # Resample if needed
+        if sr != target_sr:
+            audio = soxr.resample(audio, sr, target_sr, quality="HQ")
 
         # Max duration: 10 seconds at 16kHz = 160,000 samples
         max_samples = target_sr * 10
