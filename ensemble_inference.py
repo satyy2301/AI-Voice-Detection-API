@@ -1,217 +1,266 @@
 """
-Optimized inference module for AI vs Human voice classification.
-
-Features:
-- Wav2Vec2-only (meets constraints)
-- Low-memory loading
-- INT8 quantization (smaller + faster)
-- Multilingual support via XLSR-53
+Ensemble inference using custom TinyVoiceClassifier trained in Google Colab.
+Memory-optimized for 512MB Render deployment.
 """
 
-from typing import Optional, Dict, Any
 import torch
+import torch.nn as nn
 import numpy as np
-from transformers import AutoImageProcessor, AutoModelForImageClassification
+import torchaudio
 import torchaudio.transforms as T
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# 1. MODEL ARCHITECTURE (from your Colab training)
+# ============================================================================
+
+class TinyVoiceClassifier(nn.Module):
+    """Custom CNN for AI vs Human voice classification."""
+    
+    def __init__(self, num_classes=2):
+        super(TinyVoiceClassifier, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2)),
+            nn.Dropout(0.25),
+
+            nn.Conv2d(32, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2)),
+            nn.Dropout(0.25),
+
+            nn.Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2)),
+            nn.Dropout(0.25)
+        )
+
+        # Calculate flattened size dynamically
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 1, 64, 201)  # n_mels=64, time_frames=201
+            dummy_output = self.conv_layers(dummy_input)
+            self._num_features = dummy_output.view(-1).shape[0]
+
+        self.fc_layers = nn.Sequential(
+            nn.Linear(self._num_features, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = x.view(x.size(0), -1)  # Flatten
+        x = self.fc_layers(x)
+        return x
 
 
-# Supported languages
+# ============================================================================
+# 2. PREPROCESSING CONFIG
+# ============================================================================
+
+CONFIG = {
+    'sample_rate': 16000,
+    'n_mels': 64,
+    'n_fft': 400,
+    'hop_length': 160,
+    'duration': 2,  # seconds
+    'num_classes': 2
+}
+
 SUPPORTED_LANGUAGES = [
     "english", "spanish", "french", "german", "chinese",
     "arabic", "portuguese", "italian", "dutch", "auto"
 ]
 
-# Tiny pre-trained deepfake detection model (100MB, 85-90% accuracy)
-# ConvNeXt-Tiny trained specifically for audio deepfake classification
-MODEL_NAME = "kubinooo/convnext-tiny-224-audio-deepfake-classification"
+# ============================================================================
+# 3. GLOBAL MODEL CACHE
+# ============================================================================
 
-# Global model (loaded on demand)
-deepfake_model: Optional[AutoModelForImageClassification] = None
-image_processor: Optional[AutoImageProcessor] = None
-mel_transform: Optional[T.MelSpectrogram] = None
-quantized: bool = False
-
-
-def load_model(use_quantization: bool = True, low_cpu_mem_usage: bool = True):
-    """
-    Load ConvNeXt-Tiny deepfake detection model (pre-trained, 100MB).
-
-    Args:
-        use_quantization: Apply INT8 quantization for smaller model
-    """
-    global deepfake_model, image_processor, mel_transform, quantized
-
-    print("📦 Loading ConvNeXt-Tiny deepfake model...")
-    
-    try:
-        # Load pre-trained deepfake classifier
-        image_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-        deepfake_model = AutoModelForImageClassification.from_pretrained(
-            MODEL_NAME,
-            low_cpu_mem_usage=low_cpu_mem_usage if low_cpu_mem_usage else None
-        )
-        deepfake_model.eval()
-        deepfake_model.to('cpu')
-        
-        # Initialize mel-spectrogram transform
-        mel_transform = T.MelSpectrogram(
-            sample_rate=16000,
-            n_fft=512,
-            hop_length=256,
-            n_mels=224,  # Match model input size
-            normalized=True
-        )
-        
-        if use_quantization:
-            print("⚡ Applying INT8 dynamic quantization...")
-            deepfake_model = torch.quantization.quantize_dynamic(
-                deepfake_model,
-                {torch.nn.Linear},
-                dtype=torch.qint8
-            )
-            quantized = True
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            print("✓ INT8 quantization applied (50% smaller)")
-        else:
-            print("✓ Quantization disabled")
-        
-        print(f"✓ Loaded model: {MODEL_NAME}")
-        print("\n✨ Model loaded successfully!")
-        print("   Model: ConvNeXt-Tiny pre-trained for deepfake detection")
-        print("   Size: ~100MB (50MB quantized)")
-        print(f"   Languages supported: {', '.join(SUPPORTED_LANGUAGES)}")
-        print(f"   Quantized: {quantized}")
-        print()
-        
-    except Exception as e:
-        print(f"❌ Model load failed: {e}")
-        raise RuntimeError(f"Failed to load model: {e}")
-
-
-def ensure_model_loaded(use_quantization: bool = True, low_cpu_mem_usage: bool = True):
-    """Lazy-load model on first request to reduce startup memory spikes."""
-    if deepfake_model is None or image_processor is None or mel_transform is None:
-        load_model(use_quantization=use_quantization, low_cpu_mem_usage=low_cpu_mem_usage)
-
+_model = None
+_device = None
+_mel_transform = None
+_db_transform = None
 
 def validate_language(language: str) -> str:
-    """Validate and normalize language input."""
-    lang_lower = language.lower().strip()
-    if lang_lower not in SUPPORTED_LANGUAGES:
-        raise ValueError(
-            f"Language '{language}' not supported. "
-            f"Use one of: {', '.join(SUPPORTED_LANGUAGES)}"
-        )
-    return lang_lower
+    """Validate and return language."""
+    if language.lower() not in SUPPORTED_LANGUAGES:
+        raise ValueError(f"Unsupported language: {language}. Supported: {', '.join(SUPPORTED_LANGUAGES)}")
+    return language.lower()
 
 
-def predict(audio_waveform: np.ndarray, language: str = "english") -> Dict[str, Any]:
+def ensure_model_loaded(use_quantization=True, low_cpu_mem_usage=True):
     """
-    Predict AI vs Human using ConvNeXt-Tiny deepfake model + audio features.
-
+    Ensure model is loaded into memory.
+    
     Args:
-        audio_waveform: Processed audio (mono, 16kHz, ≤10 seconds)
-        language: Language of audio (validated)
+        use_quantization: Apply INT8 quantization (4x smaller)
+        low_cpu_mem_usage: Use low memory loading strategy
+    """
+    global _model, _device, _mel_transform, _db_transform
+    
+    if _model is not None:
+        return  # Already loaded
+    
+    logger.info("📦 Loading TinyVoiceClassifier from audio_classifier_cnn.pth...")
+    
+    try:
+        # Set device
+        _device = torch.device('cpu')  # Render free tier = CPU only
+        
+        # Initialize model
+        _model = TinyVoiceClassifier(num_classes=CONFIG['num_classes'])
+        
+        # Load weights - try models/ directory first, then root
+        model_path = None
+        try:
+            import os
+            if os.path.exists('models/audio_classifier_cnn.pth'):
+                model_path = 'models/audio_classifier_cnn.pth'
+            elif os.path.exists('audio_classifier_cnn.pth'):
+                model_path = 'audio_classifier_cnn.pth'
+            else:
+                raise FileNotFoundError("audio_classifier_cnn.pth not found")
+        except:
+            model_path = 'audio_classifier_cnn.pth'
+        
+        checkpoint = torch.load(model_path, map_location=_device)
+        _model.load_state_dict(checkpoint)
+        
+        # Apply INT8 quantization for memory efficiency
+        if use_quantization:
+            logger.info("⚡ Applying INT8 quantization...")
+            _model = torch.quantization.quantize_dynamic(
+                _model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+        
+        _model.to(_device)
+        _model.eval()
+        
+        # Initialize transforms
+        _mel_transform = T.MelSpectrogram(
+            sample_rate=CONFIG['sample_rate'],
+            n_fft=CONFIG['n_fft'],
+            hop_length=CONFIG['hop_length'],
+            n_mels=CONFIG['n_mels']
+        ).to(_device)
+        
+        _db_transform = T.AmplitudeToDB().to(_device)
+        
+        print("\n" + "="*60)
+        print("✅ TinyVoiceClassifier loaded successfully!")
+        print("="*60)
+        print(f"   Model: Custom CNN (6.64M parameters)")
+        print(f"   Size: ~26.6 MB")
+        print(f"   Memory footprint: Tens of MB (well under 512MB)")
+        print(f"   Quantized: {use_quantization}")
+        print(f"   Supported languages: {', '.join(SUPPORTED_LANGUAGES)}")
+        print("="*60 + "\n")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to load model: {e}")
+        raise RuntimeError(f"Model loading failed: {e}")
 
+
+# ============================================================================
+# 4. INFERENCE FUNCTION
+# ============================================================================
+
+def predict(audio_array: np.ndarray, language: str = "english") -> dict:
+    """
+    Predict if audio is AI-generated or Human.
+    
+    Args:
+        audio_array: Preprocessed audio (16kHz mono numpy array)
+        language: Language code (for logging/validation)
+    
     Returns:
         dict: {
-            "classification": "AI" or "Human",
-            "confidence": float (0.0-1.0),
-            "language": str
+            'classification': 'Human' or 'AI',
+            'confidence': float (0.0-1.0),
+            'language': language code
         }
     """
-    if deepfake_model is None or image_processor is None or mel_transform is None:
-        raise RuntimeError("Model not loaded")
-
+    global _model, _device, _mel_transform, _db_transform
+    
+    # Validate language
+    language = validate_language(language)
+    
+    # Ensure model is loaded
+    if _model is None:
+        ensure_model_loaded(use_quantization=True, low_cpu_mem_usage=True)
+    
     try:
-        language = validate_language(language)
-    except ValueError as e:
-        raise RuntimeError(str(e))
-
-    try:
-        # Convert audio to mel-spectrogram (image format for CNN)
-        audio_tensor = torch.from_numpy(audio_waveform).float().unsqueeze(0)
-        mel_spec = mel_transform(audio_tensor)
+        # Convert numpy array to tensor
+        waveform = torch.tensor(audio_array, dtype=torch.float32).unsqueeze(0)
         
-        # Normalize mel-spectrogram
-        mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-8)
+        # Ensure correct shape
+        if len(waveform.shape) == 1:
+            waveform = waveform.unsqueeze(0)
         
-        # Convert to 3-channel "image" for ConvNeXt
-        mel_spec_3ch = mel_spec.repeat(3, 1, 1)  # (1, 224, T) -> (3, 224, T)
+        # Pad/trim to exact duration (2 seconds at 16kHz = 32,000 samples)
+        num_samples = int(CONFIG['sample_rate'] * CONFIG['duration'])
+        if waveform.shape[1] < num_samples:
+            padding = num_samples - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, padding))
+        elif waveform.shape[1] > num_samples:
+            waveform = waveform[:, :num_samples]
         
-        # Resize to 224x224 for model input
-        mel_spec_resized = torch.nn.functional.interpolate(
-            mel_spec_3ch.unsqueeze(0),
-            size=(224, 224),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(0)
+        # Move to device
+        waveform = waveform.to(_device)
         
-        # Prepare input for model
-        inputs = image_processor(images=mel_spec_resized.permute(1, 2, 0).numpy(), return_tensors="pt")
+        # Extract mel-spectrogram
+        mel_spec = _mel_transform(waveform)
+        mel_spec_db = _db_transform(mel_spec)
         
-        # Model inference
-        with torch.inference_mode():
-            outputs = deepfake_model(**inputs)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=1)
+        # Normalize
+        mel_spec_db = (mel_spec_db - mel_spec_db.mean()) / (mel_spec_db.std() + 1e-8)
         
-        # Get prediction (label 0=Real/Human, 1=Fake/AI in most deepfake models)
-        pred_label = logits.argmax(1).item()
-        confidence_raw = float(probs[0, pred_label])
+        # Add channel dimension if needed: [batch, n_mels, time] → [batch, 1, n_mels, time]
+        if mel_spec_db.dim() == 3:
+            mel_spec_db = mel_spec_db.unsqueeze(1)
         
-        # Additional audio features for ensemble voting
-        audio_energy = float(np.mean(np.abs(audio_waveform)))
-        audio_variance = float(np.var(audio_waveform))
-        zero_crossing_rate = float(np.mean(np.abs(np.diff(np.sign(audio_waveform)))) / 2.0)
+        # Inference
+        with torch.no_grad():
+            outputs = _model(mel_spec_db)
+            probs = torch.softmax(outputs, dim=1)
+            pred_class = outputs.argmax(1).item()
         
-        # Voting: Model + 3 audio features
-        votes = {"Human": 0, "AI": 0}
+        confidence = probs[0, pred_class].item()
+        classification = "Human" if pred_class == 0 else "AI"
         
-        # Vote 1: Model prediction (weighted 2x)
-        if pred_label == 0:  # Real/Human
-            votes["Human"] += 2
-        else:  # Fake/AI
-            votes["AI"] += 2
+        logger.info(f"✓ Prediction: {classification} (confidence: {confidence:.2%}, language: {language})")
         
-        # Vote 2: Audio energy
-        if audio_energy > 0.0025:
-            votes["Human"] += 1
-        else:
-            votes["AI"] += 1
-        
-        # Vote 3: Audio variance
-        if audio_variance > 0.00005:
-            votes["Human"] += 1
-        else:
-            votes["AI"] += 1
-        
-        # Vote 4: Zero-crossing rate
-        if zero_crossing_rate > 0.08:
-            votes["Human"] += 1
-        else:
-            votes["AI"] += 1
-        
-        # Final classification
-        classification = "Human" if votes["Human"] > votes["AI"] else "AI"
-        
-        # Confidence: blend model confidence with voting confidence
-        vote_confidence = max(votes["Human"], votes["AI"]) / sum(votes.values())
-        final_confidence = 0.7 * confidence_raw + 0.3 * vote_confidence
-        
-        print(f"  Model prediction: {'Real' if pred_label == 0 else 'Fake'} ({confidence_raw:.4f})")
-        print(f"  Audio energy: {audio_energy:.4f}, variance: {audio_variance:.4f}, ZCR: {zero_crossing_rate:.4f}")
-        print(f"  Votes - Human: {votes['Human']}, AI: {votes['AI']}")
-
         return {
             "classification": classification,
-            "confidence": float(min(0.95, final_confidence)),
+            "confidence": round(confidence, 4),
             "language": language
         }
-
+    
     except Exception as e:
-        print(f"Inference error: {e}")
-        raise RuntimeError("Inference failed")
+        logger.error(f"❌ Inference error: {e}")
+        raise RuntimeError(f"Model inference failed: {e}")
+
+
+# ============================================================================
+# 5. MODEL INFO
+# ============================================================================
+
+def get_model_info() -> dict:
+    """Return model metadata."""
+    return {
+        "name": "TinyVoiceClassifier",
+        "architecture": "CNN (3 conv blocks + 2 FC layers)",
+        "parameters": 6_647_042,
+        "model_size_mb": 26.6,
+        "input_shape": [1, 1, 64, 201],
+        "output_classes": 2,
+        "class_names": ["Human", "AI"],
+        "sample_rate": CONFIG['sample_rate'],
+        "n_mels": CONFIG['n_mels'],
+        "accuracy_estimate": "85-90%",
+        "training_source": "Google Colab (custom trained)"
+    }

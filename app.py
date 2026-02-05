@@ -67,9 +67,10 @@ async def health():
     """Health check endpoint with model info."""
     return {
         "status": "ok",
-        "model": "ConvNeXt-Tiny Deepfake Classifier",
-        "size": "~50MB (quantized)",
+        "model": "TinyVoiceClassifier (Custom CNN)",
+        "size": "~26.6 MB",
         "accuracy": "85-90%",
+        "parameters": "6.64M",
         "languages": SUPPORTED_LANGUAGES
     }
 
