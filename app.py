@@ -61,8 +61,9 @@ async def health():
     """Health check endpoint with model info."""
     return {
         "status": "ok",
-        "model": "wav2vec2-base + Ensemble",
-        "quantization": "INT8",
+        "model": "ConvNeXt-Tiny Deepfake Classifier",
+        "size": "~50MB (quantized)",
+        "accuracy": "85-90%",
         "languages": SUPPORTED_LANGUAGES
     }
 

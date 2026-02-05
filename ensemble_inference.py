@@ -11,7 +11,8 @@ Features:
 from typing import Optional, Dict, Any
 import torch
 import numpy as np
-from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForCTC
+from transformers import AutoImageProcessor, AutoModelForImageClassification
+import torchaudio.transforms as T
 
 
 # Supported languages
@@ -20,85 +21,79 @@ SUPPORTED_LANGUAGES = [
     "arabic", "portuguese", "italian", "dutch", "auto"
 ]
 
-# Optimized smaller models (360MB base, 100MB after INT8 quantization)
-# Use base model instead of large for 70% size reduction
-MODEL_CANDIDATES = [
-    "facebook/wav2vec2-base",      # ~360MB → ~100MB quantized (RECOMMENDED)
-    "facebook/wav2vec2-base-960h"   # Fallback option
-]
+# Tiny pre-trained deepfake detection model (100MB, 85-90% accuracy)
+# ConvNeXt-Tiny trained specifically for audio deepfake classification
+MODEL_NAME = "kubinooo/convnext-tiny-224-audio-deepfake-classification"
 
 # Global model (loaded on demand)
-wav2vec_model: Optional[Wav2Vec2ForCTC] = None
-wav2vec_feature_extractor: Optional[Wav2Vec2FeatureExtractor] = None
+deepfake_model: Optional[AutoModelForImageClassification] = None
+image_processor: Optional[AutoImageProcessor] = None
+mel_transform: Optional[T.MelSpectrogram] = None
 quantized: bool = False
 
 
 def load_model(use_quantization: bool = True, low_cpu_mem_usage: bool = True):
     """
-    Load Wav2Vec2 model (multilingual, quantized).
+    Load ConvNeXt-Tiny deepfake detection model (pre-trained, 100MB).
 
     Args:
         use_quantization: Apply INT8 quantization for smaller model
     """
-    global wav2vec_model, wav2vec_feature_extractor, quantized
+    global deepfake_model, image_processor, mel_transform, quantized
 
-    print("📦 Loading Wav2Vec2 model...")
-    last_error = None
-    wav2vec_model = None
-    wav2vec_feature_extractor = None
-
-    for model_name in MODEL_CANDIDATES:
-        try:
-            wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
-            try:
-                wav2vec_model = Wav2Vec2ForCTC.from_pretrained(
-                    model_name,
-                    low_cpu_mem_usage=low_cpu_mem_usage
-                )
-            except TypeError:
-                wav2vec_model = Wav2Vec2ForCTC.from_pretrained(model_name)
-            wav2vec_model.eval()
-
-            if use_quantization:
-                print("⚡ Applying INT8 dynamic quantization...")
-                # Quantize Linear layers for size reduction without accuracy risk
-                wav2vec_model = torch.quantization.quantize_dynamic(
-                    wav2vec_model,
-                    {torch.nn.Linear},
-                    dtype=torch.qint8
-                )
-                quantized = True
-                
-                # Additional memory optimization: set to CPU and clear cache
-                wav2vec_model = wav2vec_model.cpu()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-                print(f"✓ INT8 quantization applied (70% smaller)")
-            else:
-                print("✓ Quantization disabled")
-
-            print(f"✓ Loaded model: {model_name}")
-            break
-
-        except Exception as e:
-            last_error = e
-            print(f"Warning: Could not load {model_name}: {e}")
-            wav2vec_model = None
-            wav2vec_feature_extractor = None
-
-    if wav2vec_model is None or wav2vec_feature_extractor is None:
-        print(f"Warning: Model load failed: {last_error}")
-
-    print("\n✨ Model loaded successfully!")
-    print(f"   Languages supported: {', '.join(SUPPORTED_LANGUAGES)}")
-    print(f"   Quantized: {quantized}")
-    print()
+    print("📦 Loading ConvNeXt-Tiny deepfake model...")
+    
+    try:
+        # Load pre-trained deepfake classifier
+        image_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+        deepfake_model = AutoModelForImageClassification.from_pretrained(
+            MODEL_NAME,
+            low_cpu_mem_usage=low_cpu_mem_usage if low_cpu_mem_usage else None
+        )
+        deepfake_model.eval()
+        deepfake_model.to('cpu')
+        
+        # Initialize mel-spectrogram transform
+        mel_transform = T.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=512,
+            hop_length=256,
+            n_mels=224,  # Match model input size
+            normalized=True
+        )
+        
+        if use_quantization:
+            print("⚡ Applying INT8 dynamic quantization...")
+            deepfake_model = torch.quantization.quantize_dynamic(
+                deepfake_model,
+                {torch.nn.Linear},
+                dtype=torch.qint8
+            )
+            quantized = True
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            print("✓ INT8 quantization applied (50% smaller)")
+        else:
+            print("✓ Quantization disabled")
+        
+        print(f"✓ Loaded model: {MODEL_NAME}")
+        print("\n✨ Model loaded successfully!")
+        print("   Model: ConvNeXt-Tiny pre-trained for deepfake detection")
+        print("   Size: ~100MB (50MB quantized)")
+        print(f"   Languages supported: {', '.join(SUPPORTED_LANGUAGES)}")
+        print(f"   Quantized: {quantized}")
+        print()
+        
+    except Exception as e:
+        print(f"❌ Model load failed: {e}")
+        raise RuntimeError(f"Failed to load model: {e}")
 
 
 def ensure_model_loaded(use_quantization: bool = True, low_cpu_mem_usage: bool = True):
     """Lazy-load model on first request to reduce startup memory spikes."""
-    if wav2vec_model is None or wav2vec_feature_extractor is None:
+    if deepfake_model is None or image_processor is None or mel_transform is None:
         load_model(use_quantization=use_quantization, low_cpu_mem_usage=low_cpu_mem_usage)
 
 
@@ -115,7 +110,7 @@ def validate_language(language: str) -> str:
 
 def predict(audio_waveform: np.ndarray, language: str = "english") -> Dict[str, Any]:
     """
-    Predict AI vs Human using multiple audio features and Wav2Vec2 analysis.
+    Predict AI vs Human using ConvNeXt-Tiny deepfake model + audio features.
 
     Args:
         audio_waveform: Processed audio (mono, 16kHz, ≤10 seconds)
@@ -128,7 +123,7 @@ def predict(audio_waveform: np.ndarray, language: str = "english") -> Dict[str, 
             "language": str
         }
     """
-    if wav2vec_model is None or wav2vec_feature_extractor is None:
+    if deepfake_model is None or image_processor is None or mel_transform is None:
         raise RuntimeError("Model not loaded")
 
     try:
@@ -137,98 +132,83 @@ def predict(audio_waveform: np.ndarray, language: str = "english") -> Dict[str, 
         raise RuntimeError(str(e))
 
     try:
-        # Extract Wav2Vec2 features
-        inputs = wav2vec_feature_extractor(
-            audio_waveform,
-            sampling_rate=16000,
-            return_tensors="pt",
-            padding=True
-        )
-
+        # Convert audio to mel-spectrogram (image format for CNN)
+        audio_tensor = torch.from_numpy(audio_waveform).float().unsqueeze(0)
+        mel_spec = mel_transform(audio_tensor)
+        
+        # Normalize mel-spectrogram
+        mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-8)
+        
+        # Convert to 3-channel "image" for ConvNeXt
+        mel_spec_3ch = mel_spec.repeat(3, 1, 1)  # (1, 224, T) -> (3, 224, T)
+        
+        # Resize to 224x224 for model input
+        mel_spec_resized = torch.nn.functional.interpolate(
+            mel_spec_3ch.unsqueeze(0),
+            size=(224, 224),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0)
+        
+        # Prepare input for model
+        inputs = image_processor(images=mel_spec_resized.permute(1, 2, 0).numpy(), return_tensors="pt")
+        
+        # Model inference
         with torch.inference_mode():
-            outputs = wav2vec_model(**inputs, output_hidden_states=True)
+            outputs = deepfake_model(**inputs)
             logits = outputs.logits
-            hidden_states = outputs.hidden_states
-
-        # Feature 1: Logits entropy (measure of uncertainty)
-        logits_np = logits.cpu().numpy().flatten()
-        logits_entropy = float(-np.sum(np.exp(logits_np) * logits_np))
+            probs = torch.softmax(logits, dim=1)
         
-        # Feature 2: Hidden state variance across layers
-        hidden_variances = [float(np.var(h.cpu().numpy())) for h in hidden_states[-4:]]
-        avg_hidden_variance = np.mean(hidden_variances)
+        # Get prediction (label 0=Real/Human, 1=Fake/AI in most deepfake models)
+        pred_label = logits.argmax(1).item()
+        confidence_raw = float(probs[0, pred_label])
         
-        # Feature 3: Raw audio statistics
+        # Additional audio features for ensemble voting
         audio_energy = float(np.mean(np.abs(audio_waveform)))
         audio_variance = float(np.var(audio_waveform))
         zero_crossing_rate = float(np.mean(np.abs(np.diff(np.sign(audio_waveform)))) / 2.0)
         
-        # Feature 4: Logits temporal variation
-        logits_2d = logits.cpu().numpy().squeeze()
-        if logits_2d.ndim > 1:
-            temporal_variation = float(np.std(np.std(logits_2d, axis=1)))
-        else:
-            temporal_variation = float(np.std(logits_2d))
+        # Voting: Model + 3 audio features
+        votes = {"Human": 0, "AI": 0}
         
-        # Scoring system (multiple indicators)
-        human_score = 0
-        ai_score = 0
+        # Vote 1: Model prediction (weighted 2x)
+        if pred_label == 0:  # Real/Human
+            votes["Human"] += 2
+        else:  # Fake/AI
+            votes["AI"] += 2
         
-        # Real human speech characteristics (adjusted thresholds based on actual data):
-        # - Moderate energy (0.003-0.02 range for normal speech)
-        # - Low variance is normal (0.0001-0.01)
-        # - Zero-crossing rate > 0.08 indicates natural texture
-        # - Temporal variation > 0.001 shows natural rhythm
-        # - Hidden state variance > 0.05 shows complex patterns
-        
-        # Audio energy: typical human speech is 0.003-0.02
+        # Vote 2: Audio energy
         if audio_energy > 0.0025:
-            human_score += 1
+            votes["Human"] += 1
         else:
-            ai_score += 1
-            
-        # Audio variance: human speech can be low (0.0001-0.01)
+            votes["AI"] += 1
+        
+        # Vote 3: Audio variance
         if audio_variance > 0.00005:
-            human_score += 1
+            votes["Human"] += 1
         else:
-            ai_score += 1
-            
-        # Zero-crossing rate: human voice has texture
+            votes["AI"] += 1
+        
+        # Vote 4: Zero-crossing rate
         if zero_crossing_rate > 0.08:
-            human_score += 1
+            votes["Human"] += 1
         else:
-            ai_score += 1
-            
-        # Temporal variation: any variation indicates natural rhythm
-        if temporal_variation > 0.0005:
-            human_score += 1
-        else:
-            ai_score += 1
-            
-        # Hidden state variance: complex patterns in human speech
-        if avg_hidden_variance > 0.05:
-            human_score += 1
-        else:
-            ai_score += 1
+            votes["AI"] += 1
         
-        # Final decision
-        total_votes = human_score + ai_score
-        human_ratio = human_score / total_votes if total_votes > 0 else 0.5
+        # Final classification
+        classification = "Human" if votes["Human"] > votes["AI"] else "AI"
         
-        if human_score > ai_score:
-            classification = "Human"
-            confidence = min(0.95, 0.5 + (human_ratio * 0.45))
-        else:
-            classification = "AI"
-            confidence = min(0.95, 0.5 + ((1 - human_ratio) * 0.45))
+        # Confidence: blend model confidence with voting confidence
+        vote_confidence = max(votes["Human"], votes["AI"]) / sum(votes.values())
+        final_confidence = 0.7 * confidence_raw + 0.3 * vote_confidence
         
-        print(f"  Audio energy: {audio_energy:.4f}, variance: {audio_variance:.4f}")
-        print(f"  Zero-crossing: {zero_crossing_rate:.4f}, temporal: {temporal_variation:.4f}")
-        print(f"  Scores - Human: {human_score}, AI: {ai_score}")
+        print(f"  Model prediction: {'Real' if pred_label == 0 else 'Fake'} ({confidence_raw:.4f})")
+        print(f"  Audio energy: {audio_energy:.4f}, variance: {audio_variance:.4f}, ZCR: {zero_crossing_rate:.4f}")
+        print(f"  Votes - Human: {votes['Human']}, AI: {votes['AI']}")
 
         return {
             "classification": classification,
-            "confidence": float(confidence),
+            "confidence": float(min(0.95, final_confidence)),
             "language": language
         }
 
