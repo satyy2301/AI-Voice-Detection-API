@@ -44,14 +44,20 @@ app = FastAPI(
 )
 
 
-# Startup log (model loads lazily on first request)
+# Startup - preload model to avoid memory spike during first request
 @app.on_event("startup")
 async def startup_event():
-    """Log startup; model loads lazily on first request to reduce memory spikes."""
+    """Preload model at startup to avoid memory spikes during first request."""
     print("\n" + "="*60)
     print("🚀 AI VOICE DETECTION API - STARTUP")
     print("="*60)
-    print("Model will load on first request (lazy load).")
+    print("Preloading model...")
+    try:
+        ensure_model_loaded(use_quantization=True, low_cpu_mem_usage=True)
+        print("✅ Model preloaded successfully!")
+    except Exception as e:
+        print(f"⚠️ Model preload failed: {e}")
+        print("Model will attempt to load on first request.")
     print("="*60 + "\n")
 
 
