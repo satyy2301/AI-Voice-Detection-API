@@ -172,6 +172,7 @@ def ensure_model_loaded(use_quantization=True, low_cpu_mem_usage=True):
 def predict(audio_array: np.ndarray, language: str = "english") -> dict:
     """
     Predict if audio is AI-generated or Human.
+    Enhanced with multi-chunk averaging, confidence calibration, and adaptive thresholds.
     
     Args:
         audio_array: Preprocessed audio (16kHz mono numpy array)
@@ -201,38 +202,264 @@ def predict(audio_array: np.ndarray, language: str = "english") -> dict:
         if len(waveform.shape) == 1:
             waveform = waveform.unsqueeze(0)
         
-        # Pad/trim to exact duration (2 seconds at 16kHz = 32,000 samples)
+        # Base configuration
         num_samples = int(CONFIG['sample_rate'] * CONFIG['duration'])
-        if waveform.shape[1] < num_samples:
-            padding = num_samples - waveform.shape[1]
-            waveform = torch.nn.functional.pad(waveform, (0, padding))
-        elif waveform.shape[1] > num_samples:
-            waveform = waveform[:, :num_samples]
         
-        # Move to device
-        waveform = waveform.to(_device)
+        # === ENHANCEMENT 1: Multi-chunk averaging ===
+        # Process audio in overlapping chunks for more stable predictions
+        chunk_results = []
+        chunk_duration = 1.5  # seconds
+        chunk_size = int(CONFIG['sample_rate'] * chunk_duration)
+        stride = int(CONFIG['sample_rate'] * 0.5)  # 0.5 second overlap
         
-        # Extract mel-spectrogram
-        mel_spec = _mel_transform(waveform)
-        mel_spec_db = _db_transform(mel_spec)
+        # Ensure we have enough audio for at least one chunk
+        if waveform.shape[1] < chunk_size:
+            # For short audio, use the whole thing
+            chunks_to_process = [waveform]
+        else:
+            chunks_to_process = []
+            for start in range(0, waveform.shape[1] - chunk_size + 1, stride):
+                end = min(start + chunk_size, waveform.shape[1])
+                chunk = waveform[:, start:end]
+                chunks_to_process.append(chunk)
         
-        # Normalize
-        mel_spec_db = (mel_spec_db - mel_spec_db.mean()) / (mel_spec_db.std() + 1e-8)
+        # Process each chunk
+        for chunk in chunks_to_process:
+            # Pad/trim to required length
+            if chunk.shape[1] < num_samples:
+                pad_len = num_samples - chunk.shape[1]
+                chunk = torch.nn.functional.pad(chunk, (0, pad_len))
+            else:
+                chunk = chunk[:, :num_samples]
+            
+            # Move to device
+            chunk = chunk.to(_device)
+            
+            # Extract mel-spectrogram
+            mel_spec = _mel_transform(chunk)
+            mel_spec_db = _db_transform(mel_spec)
+            
+            # Normalize
+            mel_spec_db = (mel_spec_db - mel_spec_db.mean()) / (mel_spec_db.std() + 1e-8)
+            
+            # Add channel dimension
+            if mel_spec_db.dim() == 3:
+                mel_spec_db = mel_spec_db.unsqueeze(1)
+            
+            # Get prediction for this chunk
+            with torch.no_grad():
+                outputs = _model(mel_spec_db)
+                probs = torch.softmax(outputs, dim=1)
+                chunk_results.append(probs[0].cpu().numpy())
         
-        # Add channel dimension if needed: [batch, n_mels, time] → [batch, 1, n_mels, time]
-        if mel_spec_db.dim() == 3:
-            mel_spec_db = mel_spec_db.unsqueeze(1)
+        # Average predictions across all chunks
+        avg_probs = np.mean(chunk_results, axis=0)
         
-        # Inference
+        # === ENHANCEMENT 2: Confidence calibration (temperature scaling) ===
+        # Reduces overconfident predictions more aggressively
+        temperature = 2.2  # Very strong smoothing
+        calibrated_logits = np.log(avg_probs + 1e-8) / temperature
+        calibrated_probs = np.exp(calibrated_logits)
+        calibrated_probs = calibrated_probs / calibrated_probs.sum()
+        
+        human_prob = float(calibrated_probs[0])
+        ai_prob = float(calibrated_probs[1])
+        
+        # === STRONG HUMAN PRIOR ===
+        # Apply Bayesian prior: Assume 70% of voices are human (real-world distribution)
+        HUMAN_PRIOR = 0.70
+        AI_PRIOR = 0.30
+        
+        # Apply Bayes' theorem
+        human_posterior = (human_prob * HUMAN_PRIOR) / ((human_prob * HUMAN_PRIOR) + (ai_prob * AI_PRIOR))
+        ai_posterior = (ai_prob * AI_PRIOR) / ((human_prob * HUMAN_PRIOR) + (ai_prob * AI_PRIOR))
+        
+        # Update probabilities with prior
+        human_prob = human_posterior
+        ai_prob = ai_posterior
+        
+        # === ENHANCEMENT 3: Audio feature analysis ===
+        # Extract audio features to vote alongside model
+        audio_energy = float(np.abs(audio_array).mean())
+        audio_std = float(np.std(audio_array))
+        zero_crossing_rate = float(np.mean(np.abs(np.diff(np.sign(audio_array)))) / 2.0)
+        
+        # === NEW: Spectral features analysis (from mel-spectrogram) ===
+        # These are computed from the already-generated mel-spectrogram
         with torch.no_grad():
-            outputs = _model(mel_spec_db)
-            probs = torch.softmax(outputs, dim=1)
-            pred_class = outputs.argmax(1).item()
+            # Use the first chunk's mel-spectrogram for spectral analysis
+            sample_mel = chunk_results[0] if len(chunk_results) > 0 else None
+            
+            if sample_mel is not None:
+                # Compute spectral features from mel-spectrogram probabilities
+                # (reusing the mel-spec we already computed)
+                
+                # Process first chunk for spectral features
+                chunk = chunks_to_process[0]
+                if chunk.shape[1] < num_samples:
+                    pad_len = num_samples - chunk.shape[1]
+                    chunk = torch.nn.functional.pad(chunk, (0, pad_len))
+                else:
+                    chunk = chunk[:, :num_samples]
+                
+                chunk = chunk.to(_device)
+                mel_spec = _mel_transform(chunk)
+                mel_spec_np = mel_spec.squeeze().cpu().numpy()
+                
+                # Spectral centroid (brightness)
+                freqs = np.arange(mel_spec_np.shape[0])
+                spectral_centroid = float(np.sum(freqs[:, None] * mel_spec_np) / (np.sum(mel_spec_np) + 1e-8))
+                spectral_centroid_norm = spectral_centroid / mel_spec_np.shape[0]  # Normalize to 0-1
+                
+                # Spectral rolloff (high frequency content)
+                cumsum = np.cumsum(np.sum(mel_spec_np, axis=1))
+                rolloff_threshold = 0.85 * cumsum[-1]
+                rolloff_idx = np.where(cumsum >= rolloff_threshold)[0][0] if len(np.where(cumsum >= rolloff_threshold)[0]) > 0 else len(cumsum) - 1
+                spectral_rolloff = float(rolloff_idx) / mel_spec_np.shape[0]
+                
+                # Spectral flux (rate of change)
+                mel_diff = np.diff(mel_spec_np, axis=1)
+                spectral_flux = float(np.mean(np.sqrt(np.sum(mel_diff**2, axis=0))))
+            else:
+                # Fallback values
+                spectral_centroid_norm = 0.5
+                spectral_rolloff = 0.85
+                spectral_flux = 0.1
         
-        confidence = probs[0, pred_class].item()
-        classification = "Human" if pred_class == 0 else "AI"
+        # Feature voting (real human voices tend to have certain characteristics)
+        feature_votes = {"Human": 0, "AI": 0}
         
-        logger.info(f"✓ Prediction: {classification} (confidence: {confidence:.2%}, language: {language})")
+        # Vote 1: Energy (human voices usually have moderate energy)
+        if 0.01 < audio_energy < 0.3:
+            feature_votes["Human"] += 1
+        elif audio_energy < 0.01:
+            feature_votes["AI"] += 1  # Too quiet, might be synthetic
+        
+        # Vote 2: Variance (real voices have natural variation)
+        if audio_std > 0.01:
+            feature_votes["Human"] += 1
+        else:
+            feature_votes["AI"] += 1
+        
+        # Vote 3: Zero-crossing rate (human speech has natural rhythm)
+        if 0.05 < zero_crossing_rate < 0.15:
+            feature_votes["Human"] += 1
+        else:
+            feature_votes["AI"] += 1
+        
+        # Vote 4: Spectral centroid (brightness - humans more varied)
+        if 0.35 < spectral_centroid_norm < 0.65:
+            feature_votes["Human"] += 1
+        else:
+            feature_votes["AI"] += 1
+        
+        # Vote 5: Spectral rolloff (AI tends to have sharper rolloff)
+        if spectral_rolloff < 0.88:
+            feature_votes["Human"] += 1
+        else:
+            feature_votes["AI"] += 1
+        
+        # Vote 6: Spectral flux (AI often too smooth)
+        if spectral_flux > 0.05:
+            feature_votes["Human"] += 1
+        else:
+            feature_votes["AI"] += 1
+        
+        # Calculate feature bias (now 6 votes instead of 3)
+        feature_bias = (feature_votes["Human"] - feature_votes["AI"]) * 0.06  # ±6% per vote
+        
+        # Apply feature bias to probabilities
+        adjusted_human_prob = min(0.99, human_prob + feature_bias)
+        adjusted_ai_prob = max(0.01, ai_prob - feature_bias)
+        
+        # Renormalize
+        total = adjusted_human_prob + adjusted_ai_prob
+        adjusted_human_prob /= total
+        adjusted_ai_prob /= total
+        
+        # === ENHANCEMENT 4: Adaptive threshold with strong AI bias penalty ===
+        # Require VERY high confidence for AI classification (beyond reasonable doubt)
+        AI_THRESHOLD = 0.78  # Increased - need 78% to call AI
+        HUMAN_THRESHOLD = 0.45  # Lower threshold for human
+        
+        # Dynamic threshold adjustment based on audio quality
+        if audio_energy > 0.02 and audio_std > 0.01:
+            # Good quality audio - can trust more
+            AI_THRESHOLD = 0.75
+        else:
+            # Poor quality - be even more conservative
+            AI_THRESHOLD = 0.82
+        
+        if adjusted_ai_prob >= AI_THRESHOLD:
+            classification = "AI"
+            confidence = adjusted_ai_prob
+        elif adjusted_human_prob >= HUMAN_THRESHOLD:
+            classification = "Human"
+            # Boost confidence based on how strongly features support human
+            feature_support = feature_votes["Human"] - feature_votes["AI"]
+            if feature_support >= 3:  # Strong feature support (5-6 votes for human)
+                confidence = min(0.88, adjusted_human_prob * 1.35)
+            elif feature_support >= 1:  # Moderate support (4 votes)
+                confidence = min(0.78, adjusted_human_prob * 1.25)
+            else:  # Weak or no support (3 or fewer votes)
+                confidence = min(0.68, adjusted_human_prob * 1.15)
+        else:
+            # Borderline case - ALWAYS favor human unless AI is overwhelmingly strong
+            if adjusted_ai_prob > 0.75:  # Need >75% to override human bias
+                classification = "AI"
+                confidence = adjusted_ai_prob * 0.65  # Heavy penalty
+            else:
+                # Default to human for all borderline cases
+                classification = "Human"
+                # Give reasonable confidence when defaulting to human
+                base_confidence = max(adjusted_human_prob, 0.50)
+                feature_support = feature_votes["Human"] - feature_votes["AI"]
+                confidence = min(0.75, base_confidence + (feature_support * 0.05))  # Up to +30% for 6 votes
+        
+        # === ENHANCEMENT 5: Quality-based confidence adjustment ===
+        
+        # === ENHANCEMENT 5: Quality-based confidence adjustment ===
+        # Only penalize AI predictions for low quality (human predictions get less penalty)
+        quality_penalty = 1.0
+        
+        if classification == "AI":
+            # Strict quality requirements for AI classification
+            if audio_energy < 0.01:
+                quality_penalty *= 0.65
+                logger.warning(f"⚠️  Very low audio energy: {audio_energy:.4f}")
+            elif audio_energy < 0.02:
+                quality_penalty *= 0.80
+            
+            if audio_std < 0.005:
+                quality_penalty *= 0.75
+                logger.warning(f"⚠️  Low audio variance: {audio_std:.4f}")
+        else:
+            # Human predictions - minimal quality penalty
+            if audio_energy < 0.005:  # Only penalize extremely low quality
+                quality_penalty *= 0.85
+                logger.warning(f"⚠️  Very low audio energy: {audio_energy:.4f}")
+        
+        confidence *= quality_penalty
+        
+        # Ensure minimum confidence for Human predictions
+        if classification == "Human":
+            confidence = max(0.55, confidence)  # Minimum 55% for human
+        
+        # Final confidence cap
+        confidence = min(confidence, 0.95)  # Never report >95% confidence
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"✓ FINAL PREDICTION: {classification} ({confidence:.2%})")
+        logger.info(f"{'='*60}")
+        logger.info(f"Raw model output - Human: {calibrated_probs[0]:.2%}, AI: {calibrated_probs[1]:.2%}")
+        logger.info(f"After human prior (70%) - Human: {human_posterior:.2%}, AI: {ai_posterior:.2%}")
+        logger.info(f"Feature votes - Human: {feature_votes['Human']}/6, AI: {feature_votes['AI']}/6 (bias: {feature_bias:+.2%})")
+        logger.info(f"Final adjusted - Human: {adjusted_human_prob:.2%}, AI: {adjusted_ai_prob:.2%}")
+        logger.info(f"Audio features:")
+        logger.info(f"  - Energy: {audio_energy:.4f}, Std: {audio_std:.4f}, ZCR: {zero_crossing_rate:.4f}")
+        logger.info(f"  - Spectral centroid: {spectral_centroid_norm:.4f}, Rolloff: {spectral_rolloff:.4f}, Flux: {spectral_flux:.4f}")
+        logger.info(f"Thresholds used - AI: {AI_THRESHOLD:.0%}, Human: {HUMAN_THRESHOLD:.0%}")
+        logger.info(f"{'='*60}\n")
         
         return {
             "classification": classification,
