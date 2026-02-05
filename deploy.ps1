@@ -4,16 +4,25 @@
 Write-Host "🚀 AI Voice Detection - Deployment Setup" -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
 
-# Step 1: Install CPU-only PyTorch
-Write-Host "`n📦 Installing optimized dependencies..." -ForegroundColor Yellow
-pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+# Step 1: Install main dependencies
+Write-Host "`n📦 Installing main dependencies..." -ForegroundColor Yellow
+pip install -r requirements.txt
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "❌ Failed to install dependencies" -ForegroundColor Red
+    Write-Host "❌ Failed to install main dependencies" -ForegroundColor Red
     exit 1
 }
 
-# Step 2: Pre-cache models
+# Step 2: Install CPU-only PyTorch
+Write-Host "`n📦 Installing CPU-only PyTorch..." -ForegroundColor Yellow
+pip install -r requirements-torch.txt --index-url https://download.pytorch.org/whl/cpu
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "❌ Failed to install PyTorch" -ForegroundColor Red
+    exit 1
+}
+
+# Step 3: Pre-cache models
 Write-Host "`n💾 Pre-caching models (this may take 2-3 minutes)..." -ForegroundColor Yellow
 python cache_models.py
 
@@ -21,7 +30,7 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "⚠️ Model caching had issues, but proceeding..." -ForegroundColor Yellow
 }
 
-# Step 3: Test the application
+# Step 4: Test the application
 Write-Host "`n✅ Testing application startup..." -ForegroundColor Yellow
 python -c @"
 from ensemble_inference import load_model
@@ -30,7 +39,7 @@ load_model(use_quantization=True)
 print('✓ Model loaded successfully!')
 "@
 
-# Step 4: Display next steps
+# Step 5: Display next steps
 Write-Host "`n✅ Ready for deployment!" -ForegroundColor Green
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Cyan

@@ -31,10 +31,16 @@ Your model has been optimized from **2.9GB → ~600MB** (79% reduction) to fit i
 ```
 **Impact**: -75% PyTorch size
 
-**Install command**:
+**Install command** (two steps):
 ```bash
-pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+# Step 1: Install main dependencies
+pip install -r requirements.txt
+
+# Step 2: Install CPU-only PyTorch from PyTorch's index
+pip install -r requirements-torch.txt --index-url https://download.pytorch.org/whl/cpu
 ```
+
+**Why separate?** The CPU-only PyTorch index only has PyTorch packages, so we install other packages from default PyPI first.
 
 ---
 
@@ -54,8 +60,8 @@ pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt
 
 ### 4. **Render.yaml Updated**
 ```yaml
-# Build command now uses CPU-only PyTorch index
-buildCommand: pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+# Build command now installs in two steps
+buildCommand: pip install -r requirements.txt && pip install -r requirements-torch.txt --index-url https://download.pytorch.org/whl/cpu
 
 # Optional: Set model cache location
 envVars:
@@ -90,9 +96,13 @@ envVars:
 
 ### Option A: Quick Deploy (Recommended)
 
-1. **Install dependencies locally**:
+1. **Install dependencies in two steps**:
    ```bash
-   pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+   # Step 1: Main dependencies
+   pip install -r requirements.txt
+   
+   # Step 2: CPU-only PyTorch (from PyTorch's index)
+   pip install -r requirements-torch.txt --index-url https://download.pytorch.org/whl/cpu
    ```
 
 2. **Push to GitHub**:
@@ -154,7 +164,8 @@ envVars:
 ### Test Locally (Windows)
 ```powershell
 # Install dependencies
-pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+pip install -r requirements.txt
+pip install -r requirements-torch.txt --index-url https://download.pytorch.org/whl/cpu
 
 # Run the app
 uvicorn app:app --reload
@@ -168,7 +179,8 @@ curl -X POST http://localhost:8000/detect ^
 
 ### Test Locally (Linux/Mac)
 ```bash
-pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+pip install -r requirements.txt
+pip install -r requirements-torch.txt --index-url https://download.pytorch.org/whl/cpu
 uvicorn app:app --reload
 
 # Test API

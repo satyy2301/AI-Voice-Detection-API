@@ -45,7 +45,7 @@
 
 1. **Update build command** (in `render.yaml`):
    ```bash
-   pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+   pip install -r requirements.txt && pip install -r requirements-torch.txt --index-url https://download.pytorch.org/whl/cpu
    ```
 
 2. **Optional: Pre-cache models** (faster first startup):
@@ -64,8 +64,9 @@
 ### For Local Testing:
 
 ```bash
-# Install CPU-only PyTorch
-pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+# Install in two steps
+pip install -r requirements.txt
+pip install -r requirements-torch.txt --index-url https://download.pytorch.org/whl/cpu
 
 # Run app
 uvicorn app:app --reload
