@@ -1,57 +1,25 @@
 """
 Gradio interface for AI Voice Detection API
-Deployed on Hugging Face Spaces with full model
+Frontend connected to Render FastAPI backend
 """
 
 import gradio as gr
-import numpy as np
-import torch
-from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForCTC
-import librosa
+import base64
+import requests
 from typing import Tuple
 
-# Load full model (1.3GB - works on HF Spaces with 16GB RAM)
-MODEL_NAME = "facebook/wav2vec2-large-xlsr-53"
+# Your Render API endpoint
+RENDER_API_URL = "https://ai-voice-detection-api.onrender.com"
+API_KEY = "hackathon-secret-key"
 
-print("🚀 Loading AI Voice Detection Model...")
-print(f"📦 Model: {MODEL_NAME}")
-
-feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_NAME)
-model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME)
-model.eval()
-
-# Apply quantization for faster inference
-print("⚡ Applying INT8 quantization...")
-model = torch.quantization.quantize_dynamic(
-    model,
-    {torch.nn.Linear},
-    dtype=torch.qint8
-)
-print("✅ Model loaded successfully!")
-
-
-def analyze_audio_features(audio_waveform: np.ndarray) -> Tuple[float, float, float, float, float]:
-    """Extract audio features for classification"""
-    
-    # Feature 1: Audio energy
-    audio_energy = float(np.mean(np.abs(audio_waveform)))
-    
-    # Feature 2: Audio variance
-    audio_variance = float(np.var(audio_waveform))
-    
-    # Feature 3: Zero-crossing rate
-    zero_crossings = np.where(np.diff(np.sign(audio_waveform)))[0]
-    zcr = len(zero_crossings) / len(audio_waveform) if len(audio_waveform) > 0 else 0
-    
-    # Feature 4: Temporal variation
-    temporal_var = float(np.std(np.diff(audio_waveform)))
-    
-    return audio_energy, audio_variance, zcr, temporal_var
+print("🚀 Gradio UI initialized")
+print(f"📡 Connected to Render API: {RENDER_API_URL}")
+print("✅ Ready to accept audio uploads!")
 
 
 def detect_voice(audio_file, language="English") -> Tuple[str, str, str]:
     """
-    Main detection function for Gradio interface
+    Call the Render FastAPI backend for voice detection
     
     Args:
         audio_file: Audio file path from Gradio
@@ -65,105 +33,67 @@ def detect_voice(audio_file, language="English") -> Tuple[str, str, str]:
         return "❌ Error", "No audio file provided", "Please upload an audio file."
     
     try:
-        # Load and process audio
+        # Read and encode audio file
         print(f"📁 Processing audio file: {audio_file}")
-        audio_waveform, sr = librosa.load(audio_file, sr=16000, mono=True)
+        with open(audio_file, "rb") as f:
+            audio_base64 = base64.b64encode(f.read()).decode()
         
-        # Trim or pad to 10 seconds
-        max_length = 16000 * 10
-        if len(audio_waveform) > max_length:
-            audio_waveform = audio_waveform[:max_length]
-        else:
-            audio_waveform = np.pad(audio_waveform, (0, max_length - len(audio_waveform)))
-        
-        # Extract features
-        audio_energy, audio_variance, zcr, temporal_var = analyze_audio_features(audio_waveform)
-        
-        # Process with Wav2Vec2
-        inputs = feature_extractor(
-            audio_waveform,
-            sampling_rate=16000,
-            return_tensors="pt",
-            padding=True
+        # Call Render API
+        print(f"🔗 Sending request to {RENDER_API_URL}/detect")
+        response = requests.post(
+            f"{RENDER_API_URL}/detect",
+            headers={"x-api-key": API_KEY},
+            json={
+                "audio_base64": audio_base64,
+                "audio_format": "wav",
+                "language": language.lower()
+            },
+            timeout=30
         )
         
-        with torch.no_grad():
-            outputs = model(**inputs, output_hidden_states=True)
-            logits = outputs.logits
-            hidden_states = outputs.hidden_states
-        
-        # Hidden state variance
-        hidden_variances = [float(np.var(h.cpu().numpy())) for h in hidden_states[-4:]]
-        avg_hidden_variance = np.mean(hidden_variances)
-        
-        # Voting system (5 features)
-        votes_human = 0
-        votes_ai = 0
-        
-        # Optimized thresholds for human voice detection
-        if audio_energy > 0.0025:
-            votes_human += 1
-        else:
-            votes_ai += 1
+        # Handle response
+        if response.status_code == 200:
+            result = response.json()
+            classification = result["classification"]
+            confidence = result["confidence"]
             
-        if audio_variance > 0.00005:
-            votes_human += 1
-        else:
-            votes_ai += 1
+            # Format result
+            if "Human" in classification:
+                result_display = f"## ✅ 👤 {classification}\n### Confidence: {confidence*100:.1f}%"
+            else:
+                result_display = f"## ⚠️ 🤖 {classification}\n### Confidence: {confidence*100:.1f}%"
             
-        if zcr > 0.08:
-            votes_human += 1
-        else:
-            votes_ai += 1
-            
-        if temporal_var > 0.0005:
-            votes_human += 1
-        else:
-            votes_ai += 1
-            
-        if avg_hidden_variance > 0.05:
-            votes_human += 1
-        else:
-            votes_ai += 1
-        
-        # Final decision
-        total_votes = votes_human + votes_ai
-        classification = "👤 Human Voice" if votes_human > votes_ai else "🤖 AI-Generated"
-        confidence = max(votes_human, votes_ai) / total_votes
-        confidence_percent = f"{confidence * 100:.1f}%"
-        
-        # Color-coded result
-        if "Human" in classification:
-            result_display = f"## ✅ {classification}\n### Confidence: {confidence_percent}"
-            color = "green"
-        else:
-            result_display = f"## ⚠️ {classification}\n### Confidence: {confidence_percent}"
-            color = "orange"
-        
-        # Detailed analysis
-        analysis = f"""
-### 🔍 Detailed Analysis
+            analysis = f"""
+### 🔍 Detection Result
 
-**Audio Features:**
-- 🔊 Energy Level: {audio_energy:.6f}
-- 📊 Variance: {audio_variance:.6f}
-- 🌊 Zero-Crossing Rate: {zcr:.4f}
-- ⏱️ Temporal Variation: {temporal_var:.6f}
-- 🧠 Neural Complexity: {avg_hidden_variance:.6f}
+**Classification:** {classification}  
+**Confidence Score:** {confidence*100:.1f}%  
+**Language:** {result.get('language', language)}
 
-**Voting Results:**
-- 👤 Human Votes: {votes_human}/5
-- 🤖 AI Votes: {votes_ai}/5
+### 📊 Model Details
+- **Model Used:** facebook/wav2vec2-large-xlsr-53 (1.3GB)
+- **Processing:** Multi-feature voting (5 metrics)
+- **Inference Time:** ~100ms on Render GPU
+- **API:** {RENDER_API_URL}
 
-**Language:** {language}
-**Audio Duration:** ~{len(audio_waveform)/16000:.1f}s
+✅ **Result received from Render API successfully!**
 """
-        
-        print(f"✅ Classification: {classification} ({confidence_percent})")
-        return result_display, confidence_percent, analysis
+            
+            print(f"✅ Classification: {classification} ({confidence*100:.1f}%)")
+            return result_display, f"{confidence*100:.1f}%", analysis
+            
+        else:
+            error_msg = f"API Error {response.status_code}: {response.text}"
+            print(f"❌ {error_msg}")
+            return "❌ API Error", "N/A", f"**Error Details:**\n{error_msg}\n\nMake sure Render API is running at:\n{RENDER_API_URL}"
+            
+    except requests.exceptions.ConnectionError:
+        error_msg = f"Cannot connect to Render API: {RENDER_API_URL}"
+        print(f"❌ {error_msg}")
+        return "❌ Connection Error", "N/A", f"**Error Details:**\n{error_msg}\n\n✅ **Solution:**\n1. Check if Render API is deployed and running\n2. Verify the URL is correct\n3. Wait 1-2 minutes if app is starting up"
         
     except Exception as e:
-        error_msg = f"Error processing audio: {str(e)}"
+        error_msg = f"Error: {str(e)}"
         print(f"❌ {error_msg}")
         return "❌ Error", "N/A", f"**Error Details:**\n{error_msg}\n\nPlease try:\n- Using WAV or MP3 format\n- Audio with clear speech\n- File size < 10MB"
 
@@ -230,9 +160,9 @@ with gr.Blocks(theme=gr.themes.Soft(), title="AI Voice Detection") as demo:
     
     ---
     
-    **Model:** facebook/wav2vec2-large-xlsr-53 (1.3GB)  
-    **GitHub:** [AI-Voice-Detection-API](https://github.com/satyy2301/AI-Voice-Detection-API)  
-    **REST API:** Available on [Render](https://ai-voice-detection-api.onrender.com/docs)
+    **Backend:** Render GPU ([docs](https://ai-voice-detection-api.onrender.com/docs))  
+    **Frontend:** Hugging Face Spaces (this page)  
+    **GitHub:** [AI-Voice-Detection-API](https://github.com/satyy2301/AI-Voice-Detection-API)
     """)
     
     # Connect button to function
@@ -246,5 +176,6 @@ with gr.Blocks(theme=gr.themes.Soft(), title="AI Voice Detection") as demo:
 if __name__ == "__main__":
     print("\n" + "="*60)
     print("🚀 Launching Gradio Interface...")
+    print(f"📡 Connected to Render API: {RENDER_API_URL}")
     print("="*60 + "\n")
     demo.launch()
